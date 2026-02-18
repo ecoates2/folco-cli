@@ -1,6 +1,6 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -26,6 +26,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Customize folder icons with a profile
+    #[command(group(
+        clap::ArgGroup::new("customization")
+            .required(true)
+            .args(["profile", "color", "decal", "overlay"])
+            .multiple(true)
+    ))]
     Customize {
         /// Directories to customize
         #[arg(required = true)]
@@ -36,39 +42,25 @@ enum Commands {
         profile: Option<String>,
 
         // === HSL Mutation Options ===
-        /// Folder color preset
-        #[arg(long, value_name = "COLOR")]
+        /// Folder color
+        #[arg(long, value_enum, value_name = "COLOR")]
         color: Option<FolderColor>,
 
         // === Decal Options ===
-        /// SVG data for decal
-        #[arg(long, value_name = "SVG", conflicts_with = "decal_svg_file")]
-        decal_svg: Option<String>,
-
-        /// Path to SVG file for decal
-        #[arg(long, value_name = "FILE", conflicts_with = "decal_svg")]
-        decal_svg_file: Option<PathBuf>,
+        /// Decal source: an SVG file path or raw SVG markup. This gets centered on the folder and tinted to a slightly darker color.
+        #[arg(long, value_name = "SOURCE")]
+        decal: Option<String>,
 
         /// Decal scale factor (0.0-1.0)
         #[arg(long, value_name = "SCALE", default_value = "0.70")]
         decal_scale: f32,
 
         // === Overlay Options ===
-        /// SVG data for overlay
-        #[arg(long, value_name = "SVG", conflicts_with_all = ["overlay_emoji", "overlay_emoji_name", "overlay_svg_file"])]
-        overlay_svg: Option<String>,
-
-        /// Path to SVG file for overlay
-        #[arg(long, value_name = "FILE", conflicts_with_all = ["overlay_svg", "overlay_emoji", "overlay_emoji_name"])]
-        overlay_svg_file: Option<PathBuf>,
-
-        /// Emoji character for overlay (rendered via twemoji)
-        #[arg(long, value_name = "EMOJI", conflicts_with_all = ["overlay_svg", "overlay_svg_file", "overlay_emoji_name"])]
-        overlay_emoji: Option<String>,
-
-        /// Emoji name for overlay (e.g., "duck", rendered via twemoji)
-        #[arg(long, value_name = "NAME", conflicts_with_all = ["overlay_svg", "overlay_svg_file", "overlay_emoji"])]
-        overlay_emoji_name: Option<String>,
+        /// Overlay source: an SVG file path, raw SVG markup, emoji character, or
+        /// emoji name (e.g. "duck").
+        /// See https://emojibase.dev/emojis for accepted emoji names
+        #[arg(long, value_name = "SOURCE")]
+        overlay: Option<String>,
 
         /// Overlay position
         #[arg(long, value_name = "POSITION", default_value = "center")]
@@ -85,6 +77,74 @@ enum Commands {
         #[arg(required = true)]
         directories: Vec<PathBuf>,
     },
+
+    /// Print the JSON Schema for CustomizationProfile
+    Schema,
+}
+
+/// Resolve an SVG source string (for decals — only SVG file paths and raw markup).
+fn resolve_svg_source(input: &str) -> Result<String> {
+    let trimmed = input.trim();
+
+    // Raw SVG markup
+    if trimmed.starts_with('<') {
+        return Ok(trimmed.to_string());
+    }
+
+    // File path
+    let path = Path::new(trimmed);
+    if path.exists() {
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read SVG file: {}", path.display()))?;
+        return Ok(contents);
+    }
+
+    bail!(
+        "Could not resolve decal source {:?}: not a file path or SVG markup. \
+         Raw SVG should start with '<'.",
+        input
+    )
+}
+
+/// Returns true if the string contains at least one emoji character.
+fn looks_like_emoji(s: &str) -> bool {
+    s.chars().any(|c| {
+        // Common emoji ranges (supplementary symbols, emoticons, dingbats, etc.)
+        matches!(c,
+            '\u{200D}'              // ZWJ
+            | '\u{FE0F}'           // variation selector
+            | '\u{20E3}'           // combining enclosing keycap
+            | '\u{2600}'..='\u{27BF}'   // misc symbols & dingbats
+            | '\u{2B50}'..='\u{2B55}'   // stars, circles
+            | '\u{1F000}'..='\u{1FAFF}' // all major emoji blocks
+        )
+    })
+}
+
+/// Resolve an overlay source string (SVG, emoji character, emoji name, or file path).
+fn resolve_overlay_source(input: &str) -> Result<SerializableSvgSource> {
+    let trimmed = input.trim();
+
+    // Raw SVG markup
+    if trimmed.starts_with('<') {
+        return Ok(SerializableSvgSource::from_svg(trimmed));
+    }
+
+    // File path (must exist on disk and have an SVG-like extension)
+    let path = Path::new(trimmed);
+    if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("svg")) && path.exists() {
+        let svg = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read overlay SVG file: {}", path.display()))?;
+        return Ok(SerializableSvgSource::from_svg(svg));
+    }
+
+    // Emoji character (contains actual emoji codepoints)
+    if looks_like_emoji(trimmed) {
+        return Ok(SerializableSvgSource::from_emoji(trimmed));
+    }
+
+    // Fallback: treat as an emoji name (e.g. "duck", "star", "heart")
+    Ok(SerializableSvgSource::from_emoji_name(trimmed))
 }
 
 #[derive(Clone, ValueEnum, Default)]
@@ -130,13 +190,9 @@ async fn main() -> Result<()> {
             directories,
             profile,
             color,
-            decal_svg,
-            decal_svg_file,
+            decal,
             decal_scale,
-            overlay_svg,
-            overlay_svg_file,
-            overlay_emoji,
-            overlay_emoji_name,
+            overlay,
             overlay_position,
             overlay_scale,
         } => {
@@ -154,16 +210,8 @@ async fn main() -> Result<()> {
                 }
 
                 // Decal
-                if decal_svg.is_some() || decal_svg_file.is_some() {
-                    let svg = if let Some(svg) = decal_svg {
-                        svg
-                    } else if let Some(path) = decal_svg_file {
-                        std::fs::read_to_string(&path)
-                            .with_context(|| format!("Failed to read decal SVG file: {}", path.display()))?
-                    } else {
-                        unreachable!()
-                    };
-
+                if let Some(ref source) = decal {
+                    let svg = resolve_svg_source(source)?;
                     p = p.with_decal(DecalSettings {
                         source: SerializableSvgSource::from_svg(svg),
                         scale: decal_scale,
@@ -172,21 +220,8 @@ async fn main() -> Result<()> {
                 }
 
                 // Overlay
-                if overlay_svg.is_some() || overlay_svg_file.is_some() || overlay_emoji.is_some() || overlay_emoji_name.is_some() {
-                    let source = if let Some(svg) = overlay_svg {
-                        SerializableSvgSource::from_svg(svg)
-                    } else if let Some(path) = overlay_svg_file {
-                        let svg = std::fs::read_to_string(&path)
-                            .with_context(|| format!("Failed to read overlay SVG file: {}", path.display()))?;
-                        SerializableSvgSource::from_svg(svg)
-                    } else if let Some(emoji) = overlay_emoji {
-                        SerializableSvgSource::from_emoji(emoji)
-                    } else if let Some(name) = overlay_emoji_name {
-                        SerializableSvgSource::from_emoji_name(name)
-                    } else {
-                        SerializableSvgSource::default()
-                    };
-
+                if let Some(ref source) = overlay {
+                    let source = resolve_overlay_source(source)?;
                     p = p.with_overlay(OverlaySettings {
                         source,
                         position: overlay_position.into(),
@@ -203,6 +238,12 @@ async fn main() -> Result<()> {
 
         Commands::Reset { directories } => {
             reset_folders(directories, cli.verbose).await?;
+        }
+
+        Commands::Schema => {
+            let schema = CustomizationProfile::json_schema_string()
+                .context("Failed to generate JSON schema")?;
+            println!("{schema}");
         }
     }
 
