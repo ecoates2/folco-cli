@@ -5,10 +5,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use folco_core::{
-    color::FolderColor,
+    folder_color::FolderColor,
     progress::{progress_channel, Progress},
-    CustomizationContextBuilder, CustomizationProfile, DecalSettings,
-    OverlaySettings, SerializablePosition, SerializableSvgSource,
+    CustomizationContextBuilder, CustomizationProfile, DecalConfig,
+    OverlayPosition, SvgOverlayConfig, SvgSource,
 };
 
 #[derive(Parser)]
@@ -41,7 +41,7 @@ enum Commands {
         #[arg(long, value_name = "JSON")]
         profile: Option<String>,
 
-        // === HSL Mutation Options ===
+        // === Color Target Options ===
         /// Folder color
         #[arg(long, value_enum, value_name = "COLOR")]
         color: Option<FolderColor>,
@@ -122,12 +122,12 @@ fn looks_like_emoji(s: &str) -> bool {
 }
 
 /// Resolve an overlay source string (SVG, emoji character, emoji name, or file path).
-fn resolve_overlay_source(input: &str) -> Result<SerializableSvgSource> {
+fn resolve_overlay_source(input: &str) -> Result<SvgSource> {
     let trimmed = input.trim();
 
     // Raw SVG markup
     if trimmed.starts_with('<') {
-        return Ok(SerializableSvgSource::from_svg(trimmed));
+        return Ok(SvgSource::Raw(trimmed.to_string()));
     }
 
     // File path (must exist on disk and have an SVG-like extension)
@@ -135,16 +135,16 @@ fn resolve_overlay_source(input: &str) -> Result<SerializableSvgSource> {
     if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("svg")) && path.exists() {
         let svg = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read overlay SVG file: {}", path.display()))?;
-        return Ok(SerializableSvgSource::from_svg(svg));
+        return Ok(SvgSource::Raw(svg));
     }
 
     // Emoji character (contains actual emoji codepoints)
     if looks_like_emoji(trimmed) {
-        return Ok(SerializableSvgSource::from_emoji(trimmed));
+        return Ok(SvgSource::Emoji(trimmed.to_string()));
     }
 
     // Fallback: treat as an emoji name (e.g. "duck", "star", "heart")
-    Ok(SerializableSvgSource::from_emoji_name(trimmed))
+    Ok(SvgSource::EmojiName(trimmed.to_string()))
 }
 
 #[derive(Clone, ValueEnum, Default)]
@@ -157,14 +157,14 @@ enum PositionArg {
     Center,
 }
 
-impl From<PositionArg> for SerializablePosition {
+impl From<PositionArg> for OverlayPosition {
     fn from(pos: PositionArg) -> Self {
         match pos {
-            PositionArg::BottomLeft => SerializablePosition::BottomLeft,
-            PositionArg::BottomRight => SerializablePosition::BottomRight,
-            PositionArg::TopLeft => SerializablePosition::TopLeft,
-            PositionArg::TopRight => SerializablePosition::TopRight,
-            PositionArg::Center => SerializablePosition::Center,
+            PositionArg::BottomLeft => OverlayPosition::BottomLeft,
+            PositionArg::BottomRight => OverlayPosition::BottomRight,
+            PositionArg::TopLeft => OverlayPosition::TopLeft,
+            PositionArg::TopRight => OverlayPosition::TopRight,
+            PositionArg::Center => OverlayPosition::Center,
         }
     }
 }
@@ -204,30 +204,25 @@ async fn main() -> Result<()> {
                 // Build profile from individual options
                 let mut p = CustomizationProfile::new();
 
-                // HSL mutation from --color preset
+                // Color target from --color preset
                 if let Some(color) = color {
-                    p = p.with_hsl_mutation(color.to_hsl_mutation_settings());
+                    p = p.with_folder_color_target(color.to_folder_color_target_config());
                 }
 
                 // Decal
                 if let Some(ref source) = decal {
                     let svg = resolve_svg_source(source)?;
-                    p = p.with_decal(DecalSettings {
-                        source: SerializableSvgSource::from_svg(svg),
-                        scale: decal_scale,
-                        enabled: true,
-                    });
+                    p = p.with_decal(DecalConfig::new(svg, decal_scale));
                 }
 
                 // Overlay
                 if let Some(ref source) = overlay {
                     let source = resolve_overlay_source(source)?;
-                    p = p.with_overlay(OverlaySettings {
+                    p = p.with_overlay(SvgOverlayConfig::new(
                         source,
-                        position: overlay_position.into(),
-                        scale: overlay_scale,
-                        enabled: true,
-                    });
+                        overlay_position.into(),
+                        overlay_scale,
+                    ));
                 }
 
                 p

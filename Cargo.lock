@@ -560,6 +560,7 @@ dependencies = [
 name = "folco-renderer"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "image",
  "palette",
  "resvg",
